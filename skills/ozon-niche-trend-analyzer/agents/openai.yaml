@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ozon 细分趋势分析"
+  short_description: "基于大品类输出 Ozon 高潜细分方向、评分与风险提示"
+  default_prompt: "Use $ozon-niche-trend-analyzer to analyze the Ozon big category 户外露营 and return 5-8 high-potential niche directions for further research."

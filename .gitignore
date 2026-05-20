@@ -1,0 +1,16 @@
+.env
+.venv/
+.pytest_cache/
+.idea/
+__pycache__/
+*.pyc
+.DS_Store
+
+auth-state*.json
+browser-profile*/
+browser-profile-*/
+
+data/exports/
+data/raw/
+data/processed/
+logs/
