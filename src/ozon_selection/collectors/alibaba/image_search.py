@@ -233,8 +233,8 @@ class Alibaba1688ImageSearchBrowser:
             launch_kwargs["proxy"] = {"server": self.settings.playwright_proxy_url}
         if self.settings.playwright_channel:
             launch_kwargs["channel"] = self.settings.playwright_channel
-        if self.settings.playwright_executable_path:
-            launch_kwargs["executable_path"] = self.settings.playwright_executable_path
+        if self.settings.playwright_executable_file:
+            launch_kwargs["executable_path"] = str(self.settings.playwright_executable_file)
 
         profile_path = user_data_dir or self.settings.alibaba1688_user_data_path
         profile_path.mkdir(parents=True, exist_ok=True)

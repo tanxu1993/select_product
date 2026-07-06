@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--browser-path",
         type=str,
-        default=settings.shopbang_cdp_browser_path,
+        default=str(settings.shopbang_cdp_browser_executable_path) if settings.shopbang_cdp_browser_executable_path else "",
         help="Chrome 可执行文件路径。",
     )
     parser.add_argument(
@@ -92,10 +92,17 @@ def main() -> None:
     """启动隔离 Chrome，并打印后续采集需要的 CDP 地址。"""
 
     args = parse_args()
-    browser_path = Path(args.browser_path).expanduser()
+    browser_path = Path(args.browser_path).expanduser() if str(args.browser_path or "").strip() else None
     user_data_dir = Path(args.user_data_dir).expanduser()
     port = max(int(args.port), 1)
     url = str(args.url or "").strip() or "about:blank"
+
+    if browser_path is None:
+        raise FileNotFoundError(
+            "未找到可用的 Chrome 可执行文件。"
+            " 请在 `.env` 中配置 `SHOPBANG_CDP_BROWSER_PATH`，"
+            " 或通过 `--browser-path` 显式传入。"
+        )
 
     if not browser_path.exists():
         raise FileNotFoundError(f"未找到 Chrome 可执行文件: {browser_path}")

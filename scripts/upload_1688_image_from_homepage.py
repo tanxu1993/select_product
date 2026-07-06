@@ -23,7 +23,6 @@ from ozon_selection.collectors.alibaba.image_search import Alibaba1688ImageSearc
 
 
 SEARCH_HOME_URL = "https://s.1688.com/"
-DEFAULT_CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
@@ -87,7 +86,9 @@ def main() -> None:
             "shopbang_cdp_url": "",
             "alibaba1688_headless": False,
             "playwright_channel": base_settings.playwright_channel or "chrome",
-            "playwright_executable_path": base_settings.playwright_executable_path or DEFAULT_CHROME_PATH,
+            "playwright_executable_path": (
+                str(base_settings.playwright_executable_file) if base_settings.playwright_executable_file else ""
+            ),
             "playwright_slow_mo_ms": max(base_settings.playwright_slow_mo_ms, 150),
         },
     )

@@ -84,6 +84,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="后台模式运行浏览器。",
     )
+    parser.add_argument(
+        "--worker-count",
+        type=int,
+        default=1,
+        help="把待分类店铺分成多少个分片并行处理，默认 1。",
+    )
+    parser.add_argument(
+        "--worker-index",
+        type=int,
+        default=1,
+        help="当前进程处理第几个分片，取值范围 1..worker-count，默认 1。",
+    )
     return parser.parse_args()
 
 
@@ -299,19 +311,34 @@ def load_target_shops(
     repository: OzonReviewedSellerRepository,
     *,
     recheck_all: bool,
+    worker_count: int = 1,
+    worker_index: int = 1,
 ) -> list[dict[str, Any]]:
     """读取待分类店铺。"""
 
     all_shops = repository.list_shops(crawl_status="all", shop_type="all")
     if recheck_all:
-        return [shop for shop in all_shops if normalize_seller_url(shop.get("seller_url") or "")]
+        shops = [shop for shop in all_shops if normalize_seller_url(shop.get("seller_url") or "")]
+    else:
+        pending_urls = repository.list_pending_shop_type_urls()
+        shops = [
+            shop
+            for shop in all_shops
+            if normalize_seller_url(shop.get("seller_url") or "") in pending_urls
+        ]
 
-    pending_urls = repository.list_pending_shop_type_urls()
-    return [
-        shop
-        for shop in all_shops
-        if normalize_seller_url(shop.get("seller_url") or "") in pending_urls
-    ]
+    normalized_worker_count = max(int(worker_count or 1), 1)
+    normalized_worker_index = max(int(worker_index or 1), 1)
+    if normalized_worker_index > normalized_worker_count:
+        raise ValueError("worker_index 不能大于 worker_count。")
+    if normalized_worker_count == 1:
+        return shops
+
+    filtered: list[dict[str, Any]] = []
+    for position, shop in enumerate(shops):
+        if position % normalized_worker_count == normalized_worker_index - 1:
+            filtered.append(shop)
+    return filtered
 
 
 def main() -> None:
@@ -325,13 +352,20 @@ def main() -> None:
     repository = OzonReviewedSellerRepository(settings=settings)
     collector = OzonCandidatePipeline(settings=settings).collector
 
-    shops = load_target_shops(repository, recheck_all=bool(args.recheck_all))
+    shops = load_target_shops(
+        repository,
+        recheck_all=bool(args.recheck_all),
+        worker_count=int(args.worker_count or 1),
+        worker_index=int(args.worker_index or 1),
+    )
     if args.max_shops and int(args.max_shops) > 0:
         shops = shops[: int(args.max_shops)]
 
     if not shops:
         print("Ozon seller shop type classification: skipped")
         print("shop_count: 0")
+        print(f"worker_count: {max(int(args.worker_count or 1), 1)}")
+        print(f"worker_index: {max(int(args.worker_index or 1), 1)}")
         print(f"sqlite_db_path: {settings.sqlite_db_path}")
         return
 
@@ -392,6 +426,8 @@ def main() -> None:
 
             print("Ozon seller shop type classification: completed")
             print(f"shop_count: {len(shops)}")
+            print(f"worker_count: {max(int(args.worker_count or 1), 1)}")
+            print(f"worker_index: {max(int(args.worker_index or 1), 1)}")
             print(f"misc_count: {misc_count}")
             print(f"vertical_count: {vertical_count}")
             print(f"failure_count: {failure_count}")

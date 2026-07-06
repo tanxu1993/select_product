@@ -274,7 +274,7 @@ def open_browser_session(playwright: Playwright, settings: Settings) -> LocalBro
     browser = browser_type.launch(
         headless=settings.shopbang_headless,
         channel=settings.playwright_channel or None,
-        executable_path=settings.playwright_executable_path or None,
+        executable_path=str(settings.playwright_executable_file) if settings.playwright_executable_file else None,
         slow_mo=settings.playwright_slow_mo_ms,
         proxy={"server": settings.playwright_proxy_url} if settings.playwright_proxy_url else None,
         args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],

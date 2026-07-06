@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 
 from config.settings import Settings
 from ozon_selection.collectors.ozon.product_collector import ProductCollector
@@ -498,6 +499,126 @@ def test_merge_page_products_deduplicates_by_sku(tmp_path: Path) -> None:
     assert [item["sku"] for item in collected_products] == ["1", "2", "3"]
 
 
+def test_resolve_page_scroll_target_uses_page_sized_goal(tmp_path: Path) -> None:
+    """单页滚动目标应限制在当前页所需卡片数，不跟随全局目标膨胀。"""
+
+    collector = build_collector(tmp_path)
+
+    assert collector.resolve_page_scroll_target(total_target=1000, collected_count=0) == 24
+    assert collector.resolve_page_scroll_target(total_target=30, collected_count=20) == 10
+    assert collector.resolve_page_scroll_target(total_target=None, collected_count=0) == 24
+    assert collector.resolve_page_scroll_target(total_target=30, collected_count=30) == 1
+
+
+def test_collect_products_across_pages_passes_page_level_scroll_target(tmp_path: Path) -> None:
+    """翻页抓取时应给滚动器传当前页目标，而不是全局目标。"""
+
+    collector = build_collector(tmp_path)
+    collector.settings.ozon_scrape_target_products = 1000
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "https://www.ozon.ru/category/demo/?sorting=rating"
+
+        def goto(self, url: str, wait_until: str, timeout: int) -> None:
+            self.url = url
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+    fake_page = FakePage()
+    scroll_targets: list[int | None] = []
+
+    collector.wait_search_results_ready = lambda page: None  # type: ignore[assignment]
+
+    def fake_scroll_to_load(page, target_count: int | None) -> None:
+        scroll_targets.append(target_count)
+
+    def fake_extract_all(page) -> list[dict]:
+        if "page=" not in page.url:
+            return [{"sku": str(index)} for index in range(1, 17)]
+        if "page=2" in page.url:
+            return [{"sku": str(index)} for index in range(17, 25)]
+        return []
+
+    collector.scroll_to_load = fake_scroll_to_load  # type: ignore[assignment]
+    collector.extract_all = fake_extract_all  # type: ignore[assignment]
+
+    results = collector.collect_products_across_pages(fake_page, target_count=20)
+
+    assert [item["sku"] for item in results] == [str(index) for index in range(1, 21)]
+    assert scroll_targets == [20, 4]
+
+
+def test_resolve_detail_worker_count_caps_by_product_count(tmp_path: Path) -> None:
+    """详情 worker 数应同时受配置值和商品数约束。"""
+
+    collector = build_collector(tmp_path)
+    collector.settings.ozon_detail_concurrency = 3
+
+    assert collector.resolve_detail_worker_count(10) == 3
+    assert collector.resolve_detail_worker_count(2) == 2
+    assert collector.resolve_detail_worker_count(0) == 1
+
+
+def test_enrich_products_with_attributes_parallel_keeps_order_and_updates_products(tmp_path: Path) -> None:
+    """并发详情抓取后，原商品列表应按原顺序写回增强结果。"""
+
+    collector = build_collector(tmp_path)
+    products = [
+        {"sku": "1", "name": "A", "price": 101, "imageUrl": "img-1", "url": "url-1"},
+        {"sku": "2", "name": "B", "price": 102, "imageUrl": "img-2", "url": "url-2"},
+        {"sku": "3", "name": "C", "price": 103, "imageUrl": "img-3", "url": "url-3"},
+        {"sku": "4", "name": "D", "price": 104, "imageUrl": "img-4", "url": "url-4"},
+    ]
+
+    def fake_run_detail_worker_batch(batch, worker_index: int, worker_count: int) -> list[tuple[int, dict]]:
+        for _, product in batch:
+            product["detailTitle"] = f"detail-{product['sku']}"
+            product["detailPrice"] = int(product["price"]) + 1000
+            product["detailImageUrl"] = f"detail-image-{product['sku']}"
+            product["attributes"] = [{"key": "SKU", "value": product["sku"]}]
+            product["deliveryInfo"] = f"delivery-{product['sku']}"
+            product["returnInfo"] = ""
+            product["warehouseInfo"] = ""
+            product["isRussianLocalWarehouse"] = False
+        return batch
+
+    collector.run_detail_worker_batch = fake_run_detail_worker_batch  # type: ignore[assignment]
+
+    result = collector.enrich_products_with_attributes_parallel(products, worker_count=2)
+
+    assert result is products
+    assert [item["sku"] for item in result] == ["1", "2", "3", "4"]
+    assert [item["detailTitle"] for item in result] == ["detail-1", "detail-2", "detail-3", "detail-4"]
+    assert [item["detailPrice"] for item in result] == [1101, 1102, 1103, 1104]
+
+
+def test_prepare_profile_copy_creates_unique_directories(tmp_path: Path) -> None:
+    """详情 profile 副本路径应唯一，避免并发 worker 相互覆盖。"""
+
+    collector = build_collector(tmp_path)
+    source_profile = tmp_path / "browser-profile"
+    source_profile.mkdir(parents=True)
+    (source_profile / "Preferences").write_text("demo", encoding="utf-8")
+    collector.settings.shopbang_user_data_dir = str(source_profile)
+
+    first = collector.prepare_profile_copy(profile_suffix="worker-a")
+    second = collector.prepare_profile_copy(profile_suffix="worker-b")
+
+    try:
+        assert first != second
+        assert first.exists()
+        assert second.exists()
+        assert (first / "Preferences").read_text(encoding="utf-8") == "demo"
+        assert (second / "Preferences").read_text(encoding="utf-8") == "demo"
+    finally:
+        if first.exists():
+            shutil.rmtree(first, ignore_errors=True)
+        if second.exists():
+            shutil.rmtree(second, ignore_errors=True)
+
+
 def test_collect_products_across_pages_stops_gracefully_on_later_page_timeout(tmp_path: Path) -> None:
     """后续分页超时应保留已抓数据并停止，而不是整轮报错。"""
 
@@ -535,3 +656,35 @@ def test_collect_products_across_pages_stops_gracefully_on_later_page_timeout(tm
     results = collector.collect_products_across_pages(fake_page)
 
     assert [item["sku"] for item in results] == ["1", "2"]
+
+
+def test_wait_detail_page_ready_returns_when_core_nodes_appear(tmp_path: Path) -> None:
+    """详情页出现标题/价格/图片任一核心节点后应立刻继续。"""
+
+    collector = build_collector(tmp_path)
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.evaluate_calls = 0
+            self.waited_timeouts: list[int] = []
+            self.load_states: list[tuple[str, int]] = []
+
+        def wait_for_load_state(self, state: str, timeout: int) -> None:
+            self.load_states.append((state, timeout))
+
+        def evaluate(self, script: str) -> dict[str, bool]:
+            self.evaluate_calls += 1
+            if self.evaluate_calls < 3:
+                return {"hasTitle": False, "hasPrice": False, "hasImage": False}
+            return {"hasTitle": True, "hasPrice": False, "hasImage": False}
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            self.waited_timeouts.append(timeout)
+
+    fake_page = FakePage()
+
+    collector.wait_detail_page_ready(fake_page)  # type: ignore[arg-type]
+
+    assert fake_page.load_states == [("domcontentloaded", 10_000)]
+    assert fake_page.evaluate_calls == 3
+    assert fake_page.waited_timeouts == [250, 250]

@@ -1,5 +1,7 @@
 """配置模块测试。"""
 
+from pathlib import Path
+
 from config.settings import Settings
 from config.settings import get_settings
 
@@ -56,6 +58,8 @@ def test_playwright_executable_settings_are_readable() -> None:
 
     assert settings.playwright_channel == "chrome"
     assert settings.playwright_executable_path.endswith("Google Chrome")
+    assert settings.playwright_executable_file is not None
+    assert str(settings.playwright_executable_file).endswith("Google Chrome")
 
 
 def test_shopbang_cdp_setting_is_readable() -> None:
@@ -78,6 +82,31 @@ def test_shopbang_cdp_launch_settings_are_readable() -> None:
     assert settings.shopbang_cdp_port == 9333
     assert settings.shopbang_cdp_browser_path.endswith("Google Chrome")
     assert settings.shopbang_cdp_user_data_path.name == "browser-profile-cdp-test"
+    assert settings.shopbang_cdp_browser_executable_path is not None
+
+
+def test_absolute_sqlite_path_is_not_joined_with_project_root() -> None:
+    """绝对路径配置应原样保留，兼容 Windows/Linux/macOS。"""
+
+    settings = Settings(SQLITE_PATH="/tmp/ozon_selection.db")
+
+    assert settings.sqlite_db_path == Path("/tmp/ozon_selection.db")
+
+
+def test_relative_sqlite_path_is_joined_with_project_root() -> None:
+    """相对路径配置应继续相对项目根目录解析。"""
+
+    settings = Settings(SQLITE_PATH="data/processed/custom.db")
+
+    assert settings.sqlite_db_path == settings.project_root / "data/processed/custom.db"
+
+
+def test_absolute_profile_path_is_not_joined_with_project_root() -> None:
+    """浏览器 profile 目录应支持绝对路径。"""
+
+    settings = Settings(SHOPBANG_USER_DATA_DIR="/tmp/browser-profile")
+
+    assert settings.shopbang_user_data_path == Path("/tmp/browser-profile")
 
 
 def test_alibaba1688_cdp_setting_falls_back_to_shopbang_cdp() -> None:

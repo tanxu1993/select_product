@@ -10,8 +10,11 @@ Python 版本对齐 `scrape-ozon.js` 的主要行为：
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import shutil
+import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -41,6 +44,9 @@ MAX_LISTED_DAYS = 365
 MIN_LISTED_DAYS_WARN = 180
 MIN_PROFIT_MARGIN = 0.10
 MAX_DETAIL_SPECS = 30
+PAGE_SCROLL_TARGET_CARDS = 24
+DETAIL_READY_POLL_INTERVAL_MS = 250
+DETAIL_READY_TIMEOUT_MS = 6_000
 
 
 @dataclass(slots=True)
@@ -274,7 +280,11 @@ class ProductCollector(BaseCollector):
                     break
                 page.wait_for_timeout(self.settings.ozon_scrape_plugin_wait_ms)
 
-            self.scroll_to_load(page, normalized_target)
+            page_target = self.resolve_page_scroll_target(
+                total_target=normalized_target,
+                collected_count=len(all_products),
+            )
+            self.scroll_to_load(page, page_target)
             page_products = self.extract_all(page)
             new_products, duplicate_products = self.merge_page_products(
                 collected_products=all_products,
@@ -298,6 +308,18 @@ class ProductCollector(BaseCollector):
         if normalized_target is None:
             return all_products
         return all_products[:normalized_target]
+
+    @staticmethod
+    def resolve_page_scroll_target(*, total_target: int | None, collected_count: int) -> int | None:
+        """把全局目标数转换成单页滚动目标，避免每页过度滚动。"""
+
+        if total_target is None:
+            return PAGE_SCROLL_TARGET_CARDS
+
+        remaining = max(int(total_target) - int(collected_count), 0)
+        if remaining <= 0:
+            return 1
+        return min(remaining, PAGE_SCROLL_TARGET_CARDS)
 
     @staticmethod
     def merge_page_products(
@@ -855,36 +877,24 @@ class ProductCollector(BaseCollector):
         if not products:
             return products
 
+        worker_count = self.resolve_detail_worker_count(len(products))
+        if context is not None or worker_count <= 1:
+            return self.enrich_products_with_attributes_serial(products, context=context)
+
+        return self.enrich_products_with_attributes_parallel(products, worker_count=worker_count)
+
+    def enrich_products_with_attributes_serial(
+        self,
+        products: list[dict[str, Any]],
+        *,
+        context: BrowserContext | None = None,
+    ) -> list[dict[str, Any]]:
+        """串行进入 Ozon 详情页补抓商品属性。"""
+
         if context is not None:
             page = context.new_page()
             try:
-                for product in products:
-                    try:
-                        detail = self.fetch_product_detail_snapshot(page, product.get("url") or "")
-                    except Exception as exc:
-                        print(
-                            f"[ozon-detail] sku={product.get('sku') or '-'} "
-                            f"url={product.get('url') or '-'} failed: {exc}",
-                            flush=True,
-                        )
-                        detail = {
-                            "title": product.get("name") or "",
-                            "price": product.get("price"),
-                            "imageUrl": product.get("imageUrl") or "",
-                            "specs": [],
-                            "deliveryInfo": "",
-                            "returnInfo": "",
-                            "warehouseInfo": "",
-                            "isRussianLocalWarehouse": False,
-                        }
-                    product["detailTitle"] = detail["title"] or product.get("name")
-                    product["detailPrice"] = detail["price"] or product.get("price")
-                    product["detailImageUrl"] = detail["imageUrl"] or product.get("imageUrl")
-                    product["attributes"] = detail["specs"]
-                    product["deliveryInfo"] = detail["deliveryInfo"]
-                    product["returnInfo"] = detail["returnInfo"]
-                    product["warehouseInfo"] = detail["warehouseInfo"]
-                    product["isRussianLocalWarehouse"] = detail["isRussianLocalWarehouse"]
+                self.enrich_products_on_page(products, page)
                 return products
             finally:
                 page.close()
@@ -895,38 +905,137 @@ class ProductCollector(BaseCollector):
             try:
                 page = context.new_page()
                 try:
-                    for product in products:
-                        try:
-                            detail = self.fetch_product_detail_snapshot(page, product.get("url") or "")
-                        except Exception as exc:
-                            print(
-                                f"[ozon-detail] sku={product.get('sku') or '-'} "
-                                f"url={product.get('url') or '-'} failed: {exc}",
-                                flush=True,
-                            )
-                            detail = {
-                                "title": product.get("name") or "",
-                                "price": product.get("price"),
-                                "imageUrl": product.get("imageUrl") or "",
-                                "specs": [],
-                                "deliveryInfo": "",
-                                "returnInfo": "",
-                                "warehouseInfo": "",
-                                "isRussianLocalWarehouse": False,
-                            }
-                        product["detailTitle"] = detail["title"] or product.get("name")
-                        product["detailPrice"] = detail["price"] or product.get("price")
-                        product["detailImageUrl"] = detail["imageUrl"] or product.get("imageUrl")
-                        product["attributes"] = detail["specs"]
-                        product["deliveryInfo"] = detail["deliveryInfo"]
-                        product["returnInfo"] = detail["returnInfo"]
-                        product["warehouseInfo"] = detail["warehouseInfo"]
-                        product["isRussianLocalWarehouse"] = detail["isRussianLocalWarehouse"]
+                    self.enrich_products_on_page(products, page)
                     return products
                 finally:
                     page.close()
             finally:
                 session.close()
+
+    def enrich_products_with_attributes_parallel(
+        self,
+        products: list[dict[str, Any]],
+        *,
+        worker_count: int,
+    ) -> list[dict[str, Any]]:
+        """使用多个详情 worker 并行补抓属性。"""
+
+        indexed_products = [(index, dict(product)) for index, product in enumerate(products)]
+        batches = self.partition_detail_batches(indexed_products, worker_count)
+        if len(batches) <= 1:
+            return self.enrich_products_with_attributes_serial(products)
+
+        futures = {}
+        with ThreadPoolExecutor(max_workers=len(batches)) as executor:
+            for worker_index, batch in enumerate(batches, start=1):
+                futures[executor.submit(self.run_detail_worker_batch, batch, worker_index, len(batches))] = worker_index
+
+            for future in as_completed(futures):
+                worker_index = futures[future]
+                try:
+                    updates = future.result()
+                except Exception as exc:
+                    raise RuntimeError(f"Ozon 详情并发 worker {worker_index} 失败: {exc}") from exc
+                for index, enriched_product in updates:
+                    products[index].update(enriched_product)
+
+        return products
+
+    def enrich_products_on_page(self, products: list[dict[str, Any]], page: Page) -> None:
+        """复用单个详情页顺序补抓一组商品属性。"""
+
+        for product in products:
+            detail = self.fetch_product_detail_snapshot_safe(page, product)
+            self.apply_detail_snapshot(product, detail)
+
+    def run_detail_worker_batch(
+        self,
+        indexed_products: list[tuple[int, dict[str, Any]]],
+        worker_index: int,
+        worker_count: int,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """单个 worker 打开独立浏览器会话，处理自己负责的商品分片。"""
+
+        thread_label = f"worker-{worker_index}-t{threading.get_ident()}"
+        with sync_playwright() as playwright:
+            session = self.open_detail_browser_session(playwright, profile_suffix=thread_label)
+            context = session.context
+            try:
+                page = context.new_page()
+                try:
+                    for index, product in indexed_products:
+                        detail = self.fetch_product_detail_snapshot_safe(page, product)
+                        self.apply_detail_snapshot(product, detail)
+                        print(
+                            f"[ozon-detail] worker={worker_index}/{worker_count} "
+                            f"sku={product.get('sku') or '-'} done",
+                            flush=True,
+                        )
+                    return indexed_products
+                finally:
+                    page.close()
+            finally:
+                session.close()
+
+    @staticmethod
+    def partition_detail_batches(
+        indexed_products: list[tuple[int, dict[str, Any]]],
+        worker_count: int,
+    ) -> list[list[tuple[int, dict[str, Any]]]]:
+        """按轮转方式把商品分配给多个 worker，减少长尾。"""
+
+        normalized_workers = max(int(worker_count), 1)
+        batches: list[list[tuple[int, dict[str, Any]]]] = [[] for _ in range(normalized_workers)]
+        for position, item in enumerate(indexed_products):
+            batches[position % normalized_workers].append(item)
+        return [batch for batch in batches if batch]
+
+    def resolve_detail_worker_count(self, product_count: int) -> int:
+        """根据配置和商品数确定详情抓取 worker 数。"""
+
+        configured = max(int(self.settings.ozon_detail_concurrency or 0), 1)
+        return min(configured, max(int(product_count), 1))
+
+    def fetch_product_detail_snapshot_safe(self, page: Page, product: dict[str, Any]) -> dict[str, Any]:
+        """抓取详情快照，失败时返回兜底结果。"""
+
+        try:
+            return self.fetch_product_detail_snapshot(page, product.get("url") or "")
+        except Exception as exc:
+            print(
+                f"[ozon-detail] sku={product.get('sku') or '-'} "
+                f"url={product.get('url') or '-'} failed: {exc}",
+                flush=True,
+            )
+            return self.build_detail_fallback_snapshot(product)
+
+    @staticmethod
+    def build_detail_fallback_snapshot(product: dict[str, Any]) -> dict[str, Any]:
+        """详情抓取失败时的兜底快照。"""
+
+        return {
+            "title": product.get("name") or "",
+            "price": product.get("price"),
+            "imageUrl": product.get("imageUrl") or "",
+            "specs": [],
+            "deliveryInfo": "",
+            "returnInfo": "",
+            "warehouseInfo": "",
+            "isRussianLocalWarehouse": False,
+        }
+
+    @staticmethod
+    def apply_detail_snapshot(product: dict[str, Any], detail: dict[str, Any]) -> None:
+        """把详情快照写回商品字典。"""
+
+        product["detailTitle"] = detail["title"] or product.get("name")
+        product["detailPrice"] = detail["price"] or product.get("price")
+        product["detailImageUrl"] = detail["imageUrl"] or product.get("imageUrl")
+        product["attributes"] = detail["specs"]
+        product["deliveryInfo"] = detail["deliveryInfo"]
+        product["returnInfo"] = detail["returnInfo"]
+        product["warehouseInfo"] = detail["warehouseInfo"]
+        product["isRussianLocalWarehouse"] = detail["isRussianLocalWarehouse"]
 
     def launch_detail_context(self, playwright: Playwright) -> BrowserContext:
         """基于已登录 profile 的副本启动详情页抓取浏览器。"""
@@ -934,7 +1043,7 @@ class ProductCollector(BaseCollector):
         session = self.open_detail_browser_session(playwright)
         return session.context
 
-    def open_detail_browser_session(self, playwright: Playwright):
+    def open_detail_browser_session(self, playwright: Playwright, *, profile_suffix: str | None = None):
         """打开详情抓取所需浏览器会话。"""
 
         if self.login_manager.should_use_cdp():
@@ -945,7 +1054,7 @@ class ProductCollector(BaseCollector):
         if not source_profile.exists():
             raise FileNotFoundError(f"未找到浏览器 profile: {source_profile}")
 
-        copied_profile = self.prepare_profile_copy()
+        copied_profile = self.prepare_profile_copy(profile_suffix=profile_suffix)
         launch_kwargs: dict[str, Any] = {
             "headless": self.settings.shopbang_headless,
             "args": self.login_manager._build_extension_args(),
@@ -960,8 +1069,8 @@ class ProductCollector(BaseCollector):
             launch_kwargs["proxy"] = {"server": self.settings.playwright_proxy_url}
         if self.settings.playwright_channel:
             launch_kwargs["channel"] = self.settings.playwright_channel
-        if self.settings.playwright_executable_path:
-            launch_kwargs["executable_path"] = self.settings.playwright_executable_path
+        if self.settings.playwright_executable_file:
+            launch_kwargs["executable_path"] = str(self.settings.playwright_executable_file)
 
         context = playwright.chromium.launch_persistent_context(
             user_data_dir=str(copied_profile),
@@ -969,14 +1078,19 @@ class ProductCollector(BaseCollector):
         )
         from ozon_selection.collectors.ozon.shopbang_auth import ShopbangBrowserSession
 
-        return ShopbangBrowserSession(context=context, owns_context=True)
+        return ShopbangBrowserSession(context=context, owns_context=True, cleanup_path=copied_profile)
 
-    def prepare_profile_copy(self) -> Path:
+    def prepare_profile_copy(self, *, profile_suffix: str | None = None) -> Path:
         """创建当前浏览器 profile 的可复用副本。"""
 
-        target_dir = self.settings.project_root / "browser-profile-e2e"
-        if target_dir.exists():
-            shutil.rmtree(target_dir)
+        prefix = "browser-profile-e2e-"
+        if profile_suffix:
+            normalized_suffix = re.sub(r"[^a-zA-Z0-9._-]+", "-", profile_suffix).strip("-")
+            if normalized_suffix:
+                prefix = f"{prefix}{normalized_suffix}-"
+
+        target_dir = Path(tempfile.mkdtemp(prefix=prefix, dir=str(self.settings.project_root)))
+        shutil.rmtree(target_dir)
 
         shutil.copytree(
             self.settings.shopbang_user_data_path,
@@ -1023,10 +1137,8 @@ class ProductCollector(BaseCollector):
             wait_until="domcontentloaded",
             timeout=self.settings.playwright_timeout_ms,
         )
-        page.wait_for_timeout(4_000)
+        self.wait_detail_page_ready(page)
         self.try_expand_spec_sections(page)
-        page.wait_for_timeout(1_500)
-        page.wait_for_load_state("domcontentloaded", timeout=10_000)
         logistics = self.extract_detail_logistics(page)
         return {
             "title": self.extract_detail_title(page),
@@ -1038,6 +1150,36 @@ class ProductCollector(BaseCollector):
             "warehouseInfo": logistics["warehouseInfo"],
             "isRussianLocalWarehouse": logistics["isRussianLocalWarehouse"],
         }
+
+    def wait_detail_page_ready(self, page: Page) -> None:
+        """等待详情页核心信息出现，避免固定 sleep。"""
+
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10_000)
+        except Exception:
+            pass
+
+        deadline = time.monotonic() + (DETAIL_READY_TIMEOUT_MS / 1000)
+        while time.monotonic() < deadline:
+            ready_state = page.evaluate(
+                """
+                () => ({
+                  hasTitle: Boolean(document.querySelector("h1")),
+                  hasPrice: Boolean(
+                    document.querySelector("[data-widget='webPrice']") ||
+                    document.querySelector("span.tsHeadline500Medium") ||
+                    document.querySelector("[class*='price']")
+                  ),
+                  hasImage: Boolean(
+                    document.querySelector("img[src*='ozonstatic']") ||
+                    document.querySelector("img[src*='ozone.ru']")
+                  ),
+                })
+                """
+            )
+            if ready_state.get("hasTitle") or ready_state.get("hasPrice") or ready_state.get("hasImage"):
+                return
+            page.wait_for_timeout(DETAIL_READY_POLL_INTERVAL_MS)
 
     @staticmethod
     def try_expand_spec_sections(page: Page) -> None:

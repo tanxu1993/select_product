@@ -7,8 +7,11 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import os
 from pathlib import Path
 import re
+import shutil
+import sys
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -206,6 +209,7 @@ class Settings(BaseSettings):
     ozon_scrape_plugin_wait_ms: int = Field(default=4_000, alias="OZON_SCRAPE_PLUGIN_WAIT_MS")
     ozon_scrape_image_wait_ms: int = Field(default=1_000, alias="OZON_SCRAPE_IMAGE_WAIT_MS")
     ozon_scrape_download_images: bool = Field(default=True, alias="OZON_SCRAPE_DOWNLOAD_IMAGES")
+    ozon_detail_concurrency: int = Field(default=3, alias="OZON_DETAIL_CONCURRENCY")
     ozon_scrape_output_dir: str = Field(default="data/exports", alias="OZON_SCRAPE_OUTPUT_DIR")
     ozon_scrape_image_dir: str = Field(default="data/raw/product_images", alias="OZON_SCRAPE_IMAGE_DIR")
     ozon_keyword_timeout_seconds: int = Field(
@@ -232,10 +236,7 @@ class Settings(BaseSettings):
     shopbang_history_url: str = Field(default="https://shopbang.cn/erp/#/history", alias="SHOPBANG_HISTORY_URL")
     shopbang_cdp_url: str = Field(default="", alias="SHOPBANG_CDP_URL")
     shopbang_cdp_port: int = Field(default=9222, alias="SHOPBANG_CDP_PORT")
-    shopbang_cdp_browser_path: str = Field(
-        default="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        alias="SHOPBANG_CDP_BROWSER_PATH",
-    )
+    shopbang_cdp_browser_path: str = Field(default="", alias="SHOPBANG_CDP_BROWSER_PATH")
     shopbang_cdp_user_data_dir: str = Field(default="browser-profile-cdp", alias="SHOPBANG_CDP_USER_DATA_DIR")
     shopbang_auth_check_url: str = Field(
         default="https://plus.shopbang.cn/api/order/ozon/getLocalNewOrder",
@@ -279,41 +280,104 @@ class Settings(BaseSettings):
 
         return Path(__file__).resolve().parent.parent
 
+    def resolve_local_path(self, raw_path: str) -> Path:
+        """把配置中的本地路径解析为绝对路径。
+
+        支持两种写法：
+        1. 相对项目根目录的相对路径
+        2. 操作系统原生绝对路径
+        """
+
+        normalized = str(raw_path or "").strip()
+        if not normalized:
+            return self.project_root
+
+        candidate = Path(normalized).expanduser()
+        if candidate.is_absolute():
+            return candidate
+        return self.project_root / candidate
+
+    @staticmethod
+    def detect_default_chrome_path() -> str:
+        """按当前操作系统探测本机 Chrome/Chromium 可执行文件。"""
+
+        command_candidates = (
+            "google-chrome",
+            "chrome",
+            "chromium",
+            "chromium-browser",
+            "msedge",
+        )
+        for command in command_candidates:
+            executable = shutil.which(command)
+            if executable:
+                return executable
+
+        if sys.platform.startswith("win"):
+            env_candidates = [
+                os.environ.get("LOCALAPPDATA", ""),
+                os.environ.get("PROGRAMFILES", ""),
+                os.environ.get("PROGRAMFILES(X86)", ""),
+            ]
+            suffixes = [
+                Path("Google/Chrome/Application/chrome.exe"),
+                Path("Chromium/Application/chrome.exe"),
+                Path("Microsoft/Edge/Application/msedge.exe"),
+            ]
+            for base_dir in env_candidates:
+                if not base_dir:
+                    continue
+                for suffix in suffixes:
+                    candidate = Path(base_dir) / suffix
+                    if candidate.exists():
+                        return str(candidate)
+            return ""
+
+        macos_candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ]
+        for candidate in macos_candidates:
+            if Path(candidate).exists():
+                return candidate
+        return ""
+
     @property
     def raw_data_path(self) -> Path:
         """返回原始采集数据目录。"""
 
-        return self.project_root / self.raw_data_dir
+        return self.resolve_local_path(self.raw_data_dir)
 
     @property
     def processed_data_path(self) -> Path:
         """返回处理后数据目录。"""
 
-        return self.project_root / self.processed_data_dir
+        return self.resolve_local_path(self.processed_data_dir)
 
     @property
     def export_path(self) -> Path:
         """返回导出文件目录。"""
 
-        return self.project_root / self.export_dir
+        return self.resolve_local_path(self.export_dir)
 
     @property
     def log_path(self) -> Path:
         """返回日志目录。"""
 
-        return self.project_root / self.log_dir
+        return self.resolve_local_path(self.log_dir)
 
     @property
     def shopbang_extension_root(self) -> Path:
         """返回上品帮插件目录。"""
 
-        return self.project_root / self.shopbang_extension_dir
+        return self.resolve_local_path(self.shopbang_extension_dir)
 
     @property
     def shopbang_extension_crx_file(self) -> Path:
         """返回上品帮插件压缩包路径。"""
 
-        return self.project_root / self.shopbang_extension_crx_path
+        return self.resolve_local_path(self.shopbang_extension_crx_path)
 
     @property
     def shopbang_extension_zip_file(self) -> Path | None:
@@ -321,43 +385,53 @@ class Settings(BaseSettings):
 
         if not self.shopbang_extension_zip_path.strip():
             return None
-        return self.project_root / self.shopbang_extension_zip_path
+        return self.resolve_local_path(self.shopbang_extension_zip_path)
 
     @property
     def shopbang_extension_unpack_path(self) -> Path:
         """返回上品帮插件解包目录。"""
 
-        return self.project_root / self.shopbang_extension_unpack_dir
+        return self.resolve_local_path(self.shopbang_extension_unpack_dir)
 
     @property
     def shopbang_user_data_path(self) -> Path:
         """返回浏览器持久化 profile 目录。"""
 
-        return self.project_root / self.shopbang_user_data_dir
+        return self.resolve_local_path(self.shopbang_user_data_dir)
 
     @property
     def shopbang_auth_state_path(self) -> Path:
         """返回 storage state 文件路径。"""
 
-        return self.project_root / self.shopbang_auth_state_file
+        return self.resolve_local_path(self.shopbang_auth_state_file)
 
     @property
     def shopbang_cdp_user_data_path(self) -> Path:
         """返回隔离的 CDP Chrome 用户目录。"""
 
-        return self.project_root / self.shopbang_cdp_user_data_dir
+        return self.resolve_local_path(self.shopbang_cdp_user_data_dir)
+
+    @property
+    def shopbang_cdp_browser_executable_path(self) -> Path | None:
+        """返回上品帮 CDP Chrome 可执行文件路径。"""
+
+        configured = str(self.shopbang_cdp_browser_path or "").strip()
+        resolved = configured or self.detect_default_chrome_path()
+        if not resolved:
+            return None
+        return Path(resolved).expanduser()
 
     @property
     def alibaba1688_user_data_path(self) -> Path:
         """返回 1688 浏览器持久化 profile 目录。"""
 
-        return self.project_root / self.alibaba1688_user_data_dir
+        return self.resolve_local_path(self.alibaba1688_user_data_dir)
 
     @property
     def alibaba1688_auth_state_path(self) -> Path:
         """返回 1688 storage state 文件路径。"""
 
-        return self.project_root / self.alibaba1688_auth_state_file
+        return self.resolve_local_path(self.alibaba1688_auth_state_file)
 
     @property
     def ozon_start_url_list(self) -> list[str]:
@@ -377,31 +451,44 @@ class Settings(BaseSettings):
     def ozon_scrape_output_path(self) -> Path:
         """返回 Ozon 选品结果导出目录。"""
 
-        return self.project_root / self.ozon_scrape_output_dir
+        return self.resolve_local_path(self.ozon_scrape_output_dir)
 
     @property
     def ozon_scrape_image_path(self) -> Path:
         """返回 Ozon 商品图片保存目录。"""
 
-        return self.project_root / self.ozon_scrape_image_dir
+        return self.resolve_local_path(self.ozon_scrape_image_dir)
 
     @property
     def product_parser_test_output_path(self) -> Path:
         """返回商品解析测试结果目录。"""
 
-        return self.project_root / self.product_parser_test_output_dir
+        return self.resolve_local_path(self.product_parser_test_output_dir)
 
     @property
     def product_parser_test_image_path(self) -> Path:
         """返回商品解析测试图片目录。"""
 
-        return self.project_root / self.product_parser_test_image_dir
+        return self.resolve_local_path(self.product_parser_test_image_dir)
 
     @property
     def sqlite_db_path(self) -> Path:
         """返回 SQLite 数据库文件路径。"""
 
-        return self.project_root / self.sqlite_path
+        return self.resolve_local_path(self.sqlite_path)
+
+    @property
+    def playwright_executable_file(self) -> Path | None:
+        """返回 Playwright 浏览器 executable 路径。"""
+
+        configured = str(self.playwright_executable_path or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+
+        detected = self.detect_default_chrome_path()
+        if not detected:
+            return None
+        return Path(detected).expanduser()
 
 
 @lru_cache(maxsize=1)

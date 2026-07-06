@@ -28,16 +28,21 @@ class ShopbangBrowserSession:
     context: BrowserContext
     browser: Browser | None = None
     owns_context: bool = True
+    cleanup_path: Path | None = None
 
     def close(self) -> None:
         """关闭当前会话。"""
 
-        if self.owns_context:
-            self.context.close()
-            return
+        try:
+            if self.owns_context:
+                self.context.close()
+                return
 
-        # CDP 模式下不要关闭用户本机 Chrome，只让进程自然释放连接。
-        return
+            # CDP 模式下不要关闭用户本机 Chrome，只让进程自然释放连接。
+            return
+        finally:
+            if self.cleanup_path and self.cleanup_path.exists():
+                shutil.rmtree(self.cleanup_path, ignore_errors=True)
 
 
 class ShopbangExtensionManager:
@@ -376,8 +381,8 @@ class ShopbangLoginManager:
 
         if self.settings.playwright_channel:
             launch_kwargs["channel"] = self.settings.playwright_channel
-        if self.settings.playwright_executable_path:
-            launch_kwargs["executable_path"] = self.settings.playwright_executable_path
+        if self.settings.playwright_executable_file:
+            launch_kwargs["executable_path"] = str(self.settings.playwright_executable_file)
 
         context = browser_type.launch_persistent_context(
             user_data_dir=str(self.settings.shopbang_user_data_path),
