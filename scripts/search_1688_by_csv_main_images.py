@@ -1,4 +1,4 @@
-"""读取 CSV 主图，直接执行 1688 以图搜图，并仅保存本地结果文件。"""
+"""读取表格主图，直接执行 1688 以图搜图，并仅保存本地结果文件。"""
 
 from __future__ import annotations
 
@@ -43,6 +43,7 @@ DEFAULT_SHOP_COLUMN = "店铺"
 DEFAULT_BRAND_COLUMN = "品牌"
 DEFAULT_CATEGORY_COLUMN = "类目"
 DEFAULT_RESUME_STATE_NAME = "csv_1688_image_search_resume_state.json"
+SUPPORTED_TABLE_SUFFIXES = {".csv", ".xlsx", ".xls"}
 IMAGE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -55,12 +56,24 @@ IMAGE_HEADERS = {
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
 
-    parser = argparse.ArgumentParser(description="读取 CSV 主图，直接执行 1688 以图搜图，并保存本地 xlsx/json。")
+    parser = argparse.ArgumentParser(description="读取 CSV 或 Excel 主图，直接执行 1688 以图搜图，并保存本地 xlsx/json。")
     parser.add_argument(
         "--csv",
         type=str,
         default=DEFAULT_CSV_NAME,
         help=f"CSV 文件路径，默认 `{DEFAULT_CSV_NAME}`。",
+    )
+    parser.add_argument(
+        "--excel",
+        type=str,
+        default="",
+        help="Excel 文件路径；传入后优先读取该文件。",
+    )
+    parser.add_argument(
+        "--sheet-name",
+        type=str,
+        default="",
+        help="可选：Excel 工作表名称；仅在读取 Excel 时生效。",
     )
     parser.add_argument(
         "--max-products",
@@ -118,15 +131,18 @@ def parse_numeric(value: Any) -> int | None:
         return None
 
 
-def resolve_csv_path(raw_path: str) -> Path:
-    """解析 CSV 路径。"""
+def resolve_source_path(*, csv_path: str, excel_path: str) -> Path:
+    """解析输入表格路径。"""
 
+    raw_path = excel_path.strip() or csv_path.strip()
     path = Path(raw_path).expanduser()
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     path = path.resolve()
     if not path.exists():
-        raise FileNotFoundError(f"未找到 CSV 文件: {path}")
+        raise FileNotFoundError(f"未找到表格文件: {path}")
+    if path.suffix.lower() not in SUPPORTED_TABLE_SUFFIXES:
+        raise ValueError(f"不支持的表格格式: {path.suffix}，仅支持 CSV/XLS/XLSX。")
     return path
 
 
@@ -180,34 +196,34 @@ def save_resume_state(state_path: Path, payload: dict[str, Any]) -> None:
     state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def build_resume_key(csv_path: Path) -> str:
-    """生成续跑状态中的 CSV 唯一键。"""
+def build_resume_key(source_path: Path) -> str:
+    """生成续跑状态中的表格唯一键。"""
 
-    return str(csv_path.resolve())
+    return str(source_path.resolve())
 
 
-def get_resume_checkpoint(state_path: Path, csv_path: Path) -> dict[str, Any]:
-    """获取指定 CSV 的续跑断点。"""
+def get_resume_checkpoint(state_path: Path, source_path: Path) -> dict[str, Any]:
+    """获取指定表格文件的续跑断点。"""
 
     state = load_resume_state(state_path)
-    checkpoint = state.get(build_resume_key(csv_path))
+    checkpoint = state.get(build_resume_key(source_path))
     return checkpoint if isinstance(checkpoint, dict) else {}
 
 
 def update_resume_checkpoint(
     state_path: Path,
     *,
-    csv_path: Path,
+    source_path: Path,
     processed_valid_products: int,
     last_completed_sku: str,
     last_run_id: str,
 ) -> None:
-    """更新指定 CSV 的续跑断点。"""
+    """更新指定表格文件的续跑断点。"""
 
     state = load_resume_state(state_path)
-    state[build_resume_key(csv_path)] = {
-        "source_reference": str(csv_path),
-        "csv_mtime_ns": csv_path.stat().st_mtime_ns,
+    state[build_resume_key(source_path)] = {
+        "source_reference": str(source_path),
+        "source_mtime_ns": source_path.stat().st_mtime_ns,
         "processed_valid_products": int(processed_valid_products),
         "last_completed_sku": last_completed_sku,
         "last_run_id": last_run_id,
@@ -216,22 +232,39 @@ def update_resume_checkpoint(
     save_resume_state(state_path, state)
 
 
-def reset_resume_checkpoint(state_path: Path, *, csv_path: Path) -> None:
-    """清空指定 CSV 的续跑断点。"""
+def reset_resume_checkpoint(state_path: Path, *, source_path: Path) -> None:
+    """清空指定表格文件的续跑断点。"""
 
     state = load_resume_state(state_path)
-    state.pop(build_resume_key(csv_path), None)
+    state.pop(build_resume_key(source_path), None)
     save_resume_state(state_path, state)
 
 
-def build_csv_products(
-    csv_path: Path,
+def read_table_rows(source_path: Path, *, sheet_name: str = "") -> list[dict[str, Any]]:
+    """读取 CSV 或 Excel 行。"""
+
+    suffix = source_path.suffix.lower()
+    if suffix == ".csv":
+        with source_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    frame = pd.read_excel(
+        source_path,
+        sheet_name=sheet_name or 0,
+    )
+    frame = frame.where(pd.notna(frame), "")
+    return frame.to_dict(orient="records")
+
+
+def build_table_products(
+    source_path: Path,
     download_root: Path,
     *,
     max_products: int | None,
     skip_valid_products: int = 0,
+    sheet_name: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """从 CSV 构造 1688 图搜图所需的 Ozon 商品结构。"""
+    """从表格构造 1688 图搜图所需的 Ozon 商品结构。"""
 
     products: list[dict[str, Any]] = []
     seen_skus: set[str] = set()
@@ -247,70 +280,69 @@ def build_csv_products(
         "download_failed": 0,
     }
 
-    batch_keyword = sanitize_filename(csv_path.stem, fallback="csv_source")
+    batch_keyword = sanitize_filename(source_path.stem, fallback="table_source")
     target_dir = download_root / batch_keyword
-    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row_index, row in enumerate(reader, start=1):
-            stats["total_rows"] += 1
+    rows = read_table_rows(source_path, sheet_name=sheet_name)
+    for row_index, row in enumerate(rows, start=1):
+        stats["total_rows"] += 1
 
-            image_url = str(row.get(DEFAULT_IMAGE_COLUMN) or "").strip()
-            if not image_url:
-                stats["skipped_missing_image"] += 1
-                continue
+        image_url = str(row.get(DEFAULT_IMAGE_COLUMN) or "").strip()
+        if not image_url:
+            stats["skipped_missing_image"] += 1
+            continue
 
-            monthly_sales = parse_numeric(row.get(DEFAULT_SALES_COLUMN))
-            if monthly_sales is None or monthly_sales <= 0:
-                stats["skipped_missing_sales"] += 1
-                continue
+        monthly_sales = parse_numeric(row.get(DEFAULT_SALES_COLUMN))
+        if monthly_sales is None or monthly_sales <= 0:
+            stats["skipped_missing_sales"] += 1
+            continue
 
-            raw_sku = str(row.get(DEFAULT_SKU_COLUMN) or "").strip()
-            sku = sanitize_filename(raw_sku, fallback=f"csv_{row_index}")
-            if sku in seen_skus:
-                stats["skipped_duplicate_sku"] += 1
-                continue
+        raw_sku = str(row.get(DEFAULT_SKU_COLUMN) or "").strip()
+        sku = sanitize_filename(raw_sku, fallback=f"table_{row_index}")
+        if sku in seen_skus:
+            stats["skipped_duplicate_sku"] += 1
+            continue
 
-            seen_skus.add(sku)
-            stats["scanned_valid_products"] += 1
-            if stats["scanned_valid_products"] <= skip_valid_products:
-                stats["skipped_resumed_products"] += 1
-                continue
+        seen_skus.add(sku)
+        stats["scanned_valid_products"] += 1
+        if stats["scanned_valid_products"] <= skip_valid_products:
+            stats["skipped_resumed_products"] += 1
+            continue
 
-            image_path = target_dir / sku / "1.jpg"
-            try:
-                before_exists = image_path.exists()
-                download_image(image_url, image_path)
-                if not before_exists and image_path.exists():
-                    stats["downloaded_images"] += 1
-            except Exception as exc:
-                stats["download_failed"] += 1
-                print(f"[csv-1688] image download failed sku={sku} url={image_url} error={exc}", flush=True)
-                continue
+        image_path = target_dir / sku / "1.jpg"
+        try:
+            before_exists = image_path.exists()
+            download_image(image_url, image_path)
+            if not before_exists and image_path.exists():
+                stats["downloaded_images"] += 1
+        except Exception as exc:
+            stats["download_failed"] += 1
+            print(f"[csv-1688] image download failed sku={sku} url={image_url} error={exc}", flush=True)
+            continue
 
-            stats["valid_rows"] += 1
-            products.append(
-                {
-                    "validProductIndex": stats["scanned_valid_products"],
-                    "sku": sku,
-                    "name": str(row.get(DEFAULT_TITLE_COLUMN) or "").strip(),
-                    "url": str(row.get(DEFAULT_URL_COLUMN) or "").strip(),
-                    "imageUrl": image_url,
-                    "localImagePath": str(image_path),
-                    "price": parse_numeric(row.get(DEFAULT_PRICE_COLUMN)),
-                    "csvPriceText": str(row.get(DEFAULT_PRICE_COLUMN) or "").strip(),
-                    "csvWeightText": str(row.get(DEFAULT_WEIGHT_COLUMN) or "").strip(),
-                    "monthlySales": monthly_sales,
-                    "dailySales": None,
-                    "batchKeyword": batch_keyword,
-                    "brand": str(row.get(DEFAULT_BRAND_COLUMN) or "").strip(),
-                    "category": str(row.get(DEFAULT_CATEGORY_COLUMN) or "").strip(),
-                    "shop": str(row.get(DEFAULT_SHOP_COLUMN) or "").strip(),
-                    "attributes": [],
-                    "rawPayload": row,
-                }
-            )
-            if max_products is not None and max_products > 0 and len(products) >= max_products:
-                break
+        stats["valid_rows"] += 1
+        products.append(
+            {
+                "validProductIndex": stats["scanned_valid_products"],
+                "sku": sku,
+                "name": str(row.get(DEFAULT_TITLE_COLUMN) or "").strip(),
+                "url": str(row.get(DEFAULT_URL_COLUMN) or "").strip(),
+                "imageUrl": image_url,
+                "localImagePath": str(image_path),
+                "price": parse_numeric(row.get(DEFAULT_PRICE_COLUMN)),
+                "csvPriceText": str(row.get(DEFAULT_PRICE_COLUMN) or "").strip(),
+                "csvWeightText": str(row.get(DEFAULT_WEIGHT_COLUMN) or "").strip(),
+                "monthlySales": monthly_sales,
+                "dailySales": None,
+                "batchKeyword": batch_keyword,
+                "brand": str(row.get(DEFAULT_BRAND_COLUMN) or "").strip(),
+                "category": str(row.get(DEFAULT_CATEGORY_COLUMN) or "").strip(),
+                "shop": str(row.get(DEFAULT_SHOP_COLUMN) or "").strip(),
+                "attributes": [],
+                "rawPayload": row,
+            }
+        )
+        if max_products is not None and max_products > 0 and len(products) >= max_products:
+            break
 
     return products, stats
 
@@ -422,11 +454,17 @@ def merge_csv_excel_group(sheet, start_row: int, end_row: int) -> None:
         cell.alignment = Alignment(vertical="center", wrap_text=True)
 
 
+def build_source_type(source_path: Path) -> str:
+    """根据输入文件后缀生成 source_type。"""
+
+    return f"{source_path.suffix.lower().removeprefix('.')} _main_images".replace(" ", "")
+
+
 def save_report_json(
     *,
     output_dir: Path,
     run_id: str,
-    csv_path: Path,
+    source_path: Path,
     auth_state_path: Path,
     excel_path: str,
     stats: dict[str, Any],
@@ -438,8 +476,8 @@ def save_report_json(
     report_path = output_dir / f"alibaba1688_image_search_{run_id}.json"
     payload = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "source_type": "csv_main_images",
-        "source_reference": str(csv_path),
+        "source_type": build_source_type(source_path),
+        "source_reference": str(source_path),
         "auth_state_path": str(auth_state_path),
         "excel_path": excel_path,
         "stats": stats,
@@ -450,10 +488,10 @@ def save_report_json(
 
 
 def main() -> None:
-    """读取 CSV 主图，执行 1688 图搜图。"""
+    """读取表格主图，执行 1688 图搜图。"""
 
     args = parse_args()
-    csv_path = resolve_csv_path(args.csv)
+    source_path = resolve_source_path(csv_path=args.csv, excel_path=args.excel)
     download_root = resolve_download_root(args.download_dir)
     settings = get_settings().model_copy(
         deep=True,
@@ -461,12 +499,12 @@ def main() -> None:
     )
     resume_state_path = get_resume_state_path(settings)
     if args.no_resume:
-        reset_resume_checkpoint(resume_state_path, csv_path=csv_path)
-    resume_checkpoint = {} if args.no_resume else get_resume_checkpoint(resume_state_path, csv_path)
-    checkpoint_mtime_ns = int(resume_checkpoint.get("csv_mtime_ns") or 0)
-    if resume_checkpoint and checkpoint_mtime_ns and checkpoint_mtime_ns != csv_path.stat().st_mtime_ns:
-        print("[csv-1688] csv file changed, ignoring old resume checkpoint.", flush=True)
-        reset_resume_checkpoint(resume_state_path, csv_path=csv_path)
+        reset_resume_checkpoint(resume_state_path, source_path=source_path)
+    resume_checkpoint = {} if args.no_resume else get_resume_checkpoint(resume_state_path, source_path)
+    checkpoint_mtime_ns = int(resume_checkpoint.get("source_mtime_ns") or 0)
+    if resume_checkpoint and checkpoint_mtime_ns and checkpoint_mtime_ns != source_path.stat().st_mtime_ns:
+        print("[csv-1688] source file changed, ignoring old resume checkpoint.", flush=True)
+        reset_resume_checkpoint(resume_state_path, source_path=source_path)
         resume_checkpoint = {}
     resume_offset = int(resume_checkpoint.get("processed_valid_products") or 0)
     if args.no_resume:
@@ -474,19 +512,20 @@ def main() -> None:
 
     pipeline = AlibabaImageSearchPipeline(settings=settings)
     run_id = time.strftime("%Y%m%d_%H%M%S")
-    products, load_stats = build_csv_products(
-        csv_path,
+    products, load_stats = build_table_products(
+        source_path,
         download_root,
         max_products=args.max_products,
         skip_valid_products=resume_offset,
+        sheet_name=args.sheet_name,
     )
     if not products:
         if resume_offset > 0 and load_stats["scanned_valid_products"] <= resume_offset:
-            print(f"[csv-1688] source csv: {csv_path}", flush=True)
+            print(f"[csv-1688] source file: {source_path}", flush=True)
             print(f"[csv-1688] resume checkpoint: already processed {resume_offset} valid products", flush=True)
             print("[csv-1688] no remaining valid products to process.", flush=True)
             return
-        raise RuntimeError("CSV 中没有可用于 1688 图搜图的有效商品。")
+        raise RuntimeError("表格中没有可用于 1688 图搜图的有效商品。")
 
     results: list[dict[str, Any]] = []
     completed_results: list[dict[str, Any]] = []
@@ -513,8 +552,10 @@ def main() -> None:
         working_page = context.new_page()
         try:
             total_products = len(products)
-            print(f"[csv-1688] source csv: {csv_path}", flush=True)
+            print(f"[csv-1688] source file: {source_path}", flush=True)
             print(f"[csv-1688] queued valid products: {total_products}", flush=True)
+            if args.sheet_name.strip():
+                print(f"[csv-1688] excel sheet: {args.sheet_name.strip()}", flush=True)
             if resume_offset > 0:
                 print(
                     f"[csv-1688] resume from valid product #{resume_offset + 1} "
@@ -549,7 +590,7 @@ def main() -> None:
                     )
                     update_resume_checkpoint(
                         resume_state_path,
-                        csv_path=csv_path,
+                        source_path=source_path,
                         processed_valid_products=global_index,
                         last_completed_sku=str(product.get("sku") or ""),
                         last_run_id=run_id,
@@ -594,7 +635,7 @@ def main() -> None:
                     completed_results.append(result_entry)
                 update_resume_checkpoint(
                     resume_state_path,
-                    csv_path=csv_path,
+                    source_path=source_path,
                     processed_valid_products=global_index,
                     last_completed_sku=str(product.get("sku") or ""),
                     last_run_id=run_id,
@@ -621,7 +662,7 @@ def main() -> None:
     report_path = save_report_json(
         output_dir=settings.ozon_scrape_output_path,
         run_id=run_id,
-        csv_path=csv_path,
+        source_path=source_path,
         auth_state_path=auth_state_path,
         excel_path=str(excel_result.get("path") or ""),
         stats=report_stats,
@@ -629,8 +670,8 @@ def main() -> None:
     )
 
     print("1688 csv image search: completed")
-    print(f"source_type: csv_main_images")
-    print(f"source_reference: {csv_path}")
+    print(f"source_type: {build_source_type(source_path)}")
+    print(f"source_reference: {source_path}")
     print(f"resume_offset: {resume_offset}")
     print(f"valid_products: {load_stats['valid_rows']}")
     print(f"processed_attempts: {len(results)}")
