@@ -5,7 +5,7 @@
 __pycache__/
 *.pyc
 .DS_Store
-
+*.csv
 auth-state*.json
 browser-profile*/
 browser-profile-*/

@@ -56,6 +56,19 @@ class Alibaba1688ImageSearchBrowser:
             return self.settings.alibaba1688_cdp_url.strip()
         return self.settings.shopbang_cdp_url.strip()
 
+    def get_bitbrowser_api_url(self) -> str:
+        """返回 BitBrowser Local API 地址。"""
+
+        return self.settings.alibaba1688_bitbrowser_api_url.strip().rstrip("/")
+
+    def should_use_bitbrowser(self) -> bool:
+        """判断是否启用 BitBrowser Local API。"""
+
+        return bool(
+            self.get_bitbrowser_api_url()
+            and self.settings.alibaba1688_bitbrowser_browser_id.strip()
+        )
+
     def get_adspower_api_url(self) -> str:
         """返回 AdsPower Local API 地址，并兼容 localhost 回退。"""
 
@@ -86,6 +99,9 @@ class Alibaba1688ImageSearchBrowser:
     ) -> Alibaba1688BrowserSession:
         """打开 1688 浏览器会话，支持 CDP 连接。"""
 
+        if self.should_use_bitbrowser():
+            return self.open_bitbrowser_session(playwright, headless=headless)
+
         if self.should_use_adspower():
             return self.open_adspower_session(playwright, headless=headless)
 
@@ -113,6 +129,49 @@ class Alibaba1688ImageSearchBrowser:
             user_data_dir=user_data_dir,
         )
         return Alibaba1688BrowserSession(context=context, owns_context=True)
+
+    def open_bitbrowser_session(
+        self,
+        playwright: Playwright,
+        *,
+        headless: bool | None = None,
+    ) -> Alibaba1688BrowserSession:
+        """通过 BitBrowser Local API 启动指定窗口，并连接返回的 CDP 端点。"""
+
+        browser_id = self.settings.alibaba1688_bitbrowser_browser_id.strip()
+        if not browser_id:
+            raise Alibaba1688ImageSearchError(
+                "已配置 BitBrowser API，但缺少 `ALIBABA1688_BITBROWSER_BROWSER_ID`。"
+            )
+
+        response = self.start_bitbrowser_browser(browser_id=browser_id, headless=headless)
+        data = response.get("data") or {}
+        ws_endpoint = str(data.get("ws") or "").strip()
+        http_endpoint = str(data.get("http") or "").strip()
+        cdp_endpoint = ws_endpoint or self.normalize_bitbrowser_http_endpoint(http_endpoint)
+        if not cdp_endpoint:
+            cdp_endpoint = self.get_bitbrowser_debug_endpoint(browser_id=browser_id)
+        if not cdp_endpoint:
+            raise Alibaba1688ImageSearchError(
+                f"BitBrowser 已启动 browser_id={browser_id}，但返回里缺少可用的 CDP 地址。"
+            )
+
+        print(f"[1688] connecting to BitBrowser browser: {cdp_endpoint}", flush=True)
+        browser = playwright.chromium.connect_over_cdp(
+            cdp_endpoint,
+            timeout=self.settings.playwright_timeout_ms,
+        )
+        if not browser.contexts:
+            self.stop_bitbrowser_browser(browser_id=browser_id)
+            raise Alibaba1688ImageSearchError(
+                "已连接到 BitBrowser 浏览器，但未发现可用浏览器上下文。"
+            )
+        return Alibaba1688BrowserSession(
+            context=browser.contexts[0],
+            browser=browser,
+            owns_context=False,
+            on_close=lambda: self.stop_bitbrowser_browser(browser_id=browser_id),
+        )
 
     def open_adspower_session(
         self,
@@ -155,6 +214,91 @@ class Alibaba1688ImageSearchBrowser:
             owns_context=False,
             on_close=lambda: self.stop_adspower_browser(profile_id=profile_id),
         )
+
+    def start_bitbrowser_browser(self, *, browser_id: str, headless: bool | None = None) -> dict[str, Any]:
+        """调用 BitBrowser Local API 打开浏览器窗口。"""
+
+        endpoint = f"{self.get_bitbrowser_api_url()}/browser/open"
+        launch_args: list[str] = []
+        if self.settings.alibaba1688_headless if headless is None else headless:
+            launch_args.append("--headless")
+        payload = {
+            "id": browser_id,
+            "args": launch_args,
+            "queue": True,
+            "ignoreDefaultUrls": True,
+        }
+        try:
+            response = requests.post(
+                endpoint,
+                json=payload,
+                timeout=self.settings.openai_timeout_seconds,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise Alibaba1688ImageSearchError(f"调用 BitBrowser 打开接口失败: {exc}") from exc
+
+        result = response.json()
+        if not result.get("success"):
+            raise Alibaba1688ImageSearchError(
+                f"BitBrowser 打开失败: {result.get('msg') or result}"
+            )
+        return result
+
+    def stop_bitbrowser_browser(self, *, browser_id: str) -> None:
+        """调用 BitBrowser Local API 关闭浏览器窗口。"""
+
+        endpoint = f"{self.get_bitbrowser_api_url()}/browser/close"
+        try:
+            response = requests.post(
+                endpoint,
+                json={"id": browser_id},
+                timeout=15,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("success"):
+                print(
+                    f"[1688] BitBrowser close warning for browser_id={browser_id}: {payload.get('msg') or payload}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"[1688] BitBrowser close warning for browser_id={browser_id}: {exc}",
+                flush=True,
+            )
+
+    def get_bitbrowser_debug_endpoint(self, *, browser_id: str) -> str:
+        """从 BitBrowser 端口接口补取调试端口。"""
+
+        endpoint = f"{self.get_bitbrowser_api_url()}/browser/ports"
+        try:
+            response = requests.post(
+                endpoint,
+                json={},
+                timeout=15,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException:
+            return ""
+
+        if not payload.get("success"):
+            return ""
+
+        port = str((payload.get("data") or {}).get(browser_id) or "").strip()
+        return f"http://127.0.0.1:{port}" if port else ""
+
+    @staticmethod
+    def normalize_bitbrowser_http_endpoint(http_endpoint: str) -> str:
+        """规范化 BitBrowser 返回的 http 调试地址。"""
+
+        normalized = str(http_endpoint or "").strip()
+        if not normalized:
+            return ""
+        if normalized.startswith(("http://", "https://", "ws://", "wss://")):
+            return normalized
+        return f"http://{normalized}"
 
     def start_adspower_browser(self, *, profile_id: str, headless: bool | None = None) -> dict[str, Any]:
         """调用 AdsPower Local API 启动浏览器 profile。"""

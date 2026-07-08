@@ -132,6 +132,14 @@ class Settings(BaseSettings):
         alias="ALIBABA1688_IMAGE_SEARCH_URL",
     )
     alibaba1688_image_search_tab: str = Field(default="imageSearch", alias="ALIBABA1688_IMAGE_SEARCH_TAB")
+    alibaba1688_bitbrowser_api_url: str = Field(
+        default="",
+        alias="ALIBABA1688_BITBROWSER_API_URL",
+    )
+    alibaba1688_bitbrowser_browser_id: str = Field(
+        default="",
+        alias="ALIBABA1688_BITBROWSER_BROWSER_ID",
+    )
     alibaba1688_adspower_api_url: str = Field(
         default="",
         alias="ALIBABA1688_ADSPOWER_API_URL",
