@@ -546,6 +546,154 @@ python scripts/search_1688_by_saved_images.py --max-products 5 --max-results 5
 - 先做 GPT 主图相似度筛选
 - 再抓最优结果的详情参数
 
+## 补充入口：按 CSV/Excel 主图直接跑 1688 图搜图
+
+脚本：
+
+```bash
+python scripts/search_1688_by_csv_main_images.py
+```
+
+这个入口不依赖 SQLite 人审结果，直接读取 CSV 或 Excel 里的商品主图链接，下载主图后在 1688 做图搜图，适合历史表格回跑和外部选品表批量处理。
+
+### 前置条件
+
+- 已在 `.env` 里配置 `ALIBABA1688_BITBROWSER_API_URL=http://127.0.0.1:54345`
+- 如果走 BitBrowser 多窗口模式，每个 `browser_id` 对应的窗口里都要提前登录不同的 1688 账号
+- 已安装 Playwright 依赖和 Chromium
+- 输入表至少要有这些列：
+  - `主图`
+  - `标题`
+  - `详情页地址`
+  - `SKU`
+  - `销量`
+  - `售价`
+  - `重量`
+
+### 主要功能
+
+- 支持读取 `CSV / XLSX / XLS`
+- 支持指定 Excel 工作表
+- 自动下载表格里的主图到本地，再上传到 1688 图搜图
+- 先做 GPT 主图相似度筛选，再抓最优结果详情
+- 支持 BitBrowser 多进程并发；每个 worker 绑定不同 `browser_id`，也就是不同 1688 账号
+- 支持断点续跑；重跑同一个表格时会跳过已经完成的行
+- 运行时持续打印 `completed: X/Y`
+- 最终导出 `xlsx + json`
+- 导出表新增 `利润率` 列；无法计算时会写明确原因，不留空
+
+### 命令参数
+
+- `--csv`
+  - CSV 文件路径
+  - 默认值：`Seerfar-Product20260706_2000.csv`
+- `--excel`
+  - Excel 文件路径
+  - 传入后优先于 `--csv`
+- `--sheet-name`
+  - Excel 工作表名称
+  - 仅 `--excel` 时生效
+- `--max-products`
+  - 只处理前 N 个有效商品
+- `--max-results`
+  - 每个商品最多抓前 N 个 1688 结果
+- `--download-dir`
+  - 表格主图下载目录
+  - 默认值：`data/raw/csv_source_images`
+- `--background`
+  - 后台模式运行 1688 浏览器
+- `--bitbrowser-browser-ids`
+  - 多个 BitBrowser 窗口 ID，逗号分隔
+  - 多 worker 时每个 worker 会绑定一个独立窗口和独立 1688 账号
+- `--workers`
+  - 并发 worker 数
+  - 默认等于传入的 `browser_id` 数量
+  - 不能大于 `--bitbrowser-browser-ids` 里的窗口数量
+- `--no-resume`
+  - 忽略历史断点，从头处理当前表格
+
+### 推荐用法
+
+单窗口调试：
+
+```bash
+python scripts/search_1688_by_csv_main_images.py \
+  --excel your_products.xlsx \
+  --sheet-name Sheet1 \
+  --max-products 5 \
+  --max-results 3
+```
+
+多窗口并发：
+
+```bash
+python scripts/search_1688_by_csv_main_images.py \
+  --excel your_products.xlsx \
+  --sheet-name Sheet1 \
+  --max-products 100 \
+  --max-results 3 \
+  --bitbrowser-browser-ids id_1,id_2,id_3 \
+  --workers 3
+```
+
+CSV 输入：
+
+```bash
+python scripts/search_1688_by_csv_main_images.py \
+  --csv Seerfar-Product20260706_2000.csv \
+  --max-products 20 \
+  --max-results 3
+```
+
+### 断点续跑
+
+- 断点文件：`data/processed/csv_1688_image_search_resume_state.json`
+- 如果上一次已经跑到有效商品第 `1000` 个，下次默认从 `1001` 开始
+- 多 worker 模式下也支持续跑；脚本会记录已完成的离散索引，避免整批重跑
+- 如果输入文件内容被改动，旧断点会自动失效
+- 需要强制从头跑时，加 `--no-resume`
+
+### 输出结果
+
+- Excel：`data/exports/alibaba1688_image_search_*.xlsx`
+- JSON：`data/exports/alibaba1688_image_search_*.json`
+- 下载的原图：`data/raw/csv_source_images/<表名>/<SKU>/1.jpg`
+
+导出表会包含：
+
+- 原表售价
+- 原表重量
+- 1688 单价
+- 1688 重量
+- GPT 主图判断结果
+- 利润率
+
+### 利润率规则
+
+- 汇率固定：`1 人民币 = 11 卢布`
+- `原表售价` 单位是卢布
+- 运费和 `1688单价` 单位是人民币
+
+规则 1：
+
+- 当 `原表售价 <= 1500 卢布`
+- 且 `原表重量` 在 `1-500g`
+- 运费 = `3 + 0.035 × 重量`
+- 利润率 = `[原表售价 - (运费 + 1688单价) × 11] / 原表售价`
+
+规则 2：
+
+- 当 `原表售价` 在 `1501-7000 卢布`
+- 且 `原表重量` 在 `1-2000g`
+- 运费 = `16 + 0.035 × 重量`
+- 利润率 = `[原表售价 - (运费 + 1688单价) × 11] / 原表售价`
+
+如果利润率算不出来，`利润率` 单元格会直接写原因，例如：
+
+- `原表重量缺失`
+- `1688单价缺失`
+- `售价与重量组合不适用当前运费规则: 售价=1200.00卢布, 重量=800g`
+
 ## 当前推荐工作流
 
 ### 路径一

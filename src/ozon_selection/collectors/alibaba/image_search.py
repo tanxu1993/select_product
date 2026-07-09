@@ -801,7 +801,7 @@ class Alibaba1688ImageSearchBrowser:
             source_profile.mkdir(parents=True, exist_ok=True)
             return source_profile
 
-        target_dir = self.settings.project_root / "browser-profile-1688-e2e"
+        target_dir = self.settings.project_root / f"{source_profile.name}-e2e"
         if target_dir.exists():
             shutil.rmtree(target_dir)
 
