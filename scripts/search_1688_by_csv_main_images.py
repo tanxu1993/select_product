@@ -48,6 +48,7 @@ DEFAULT_CATEGORY_COLUMN = "类目"
 DEFAULT_RESUME_STATE_NAME = "csv_1688_image_search_resume_state.json"
 SUPPORTED_TABLE_SUFFIXES = {".csv", ".xlsx", ".xls"}
 DEFAULT_CNY_TO_RUB_EXCHANGE_RATE = 11.0
+CSV_FALLBACK_ENCODINGS = ("utf-8-sig", "utf-8", "gb2312", "gbk", "gb18030")
 IMAGE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -320,8 +321,26 @@ def read_table_rows(source_path: Path, *, sheet_name: str = "") -> list[dict[str
 
     suffix = source_path.suffix.lower()
     if suffix == ".csv":
-        with source_path.open("r", encoding="utf-8-sig", newline="") as handle:
-            return list(csv.DictReader(handle))
+        last_error: UnicodeDecodeError | None = None
+        for encoding in CSV_FALLBACK_ENCODINGS:
+            try:
+                with source_path.open("r", encoding=encoding, newline="") as handle:
+                    rows = list(csv.DictReader(handle))
+                print(f"[csv-1688] loaded csv with encoding={encoding}", flush=True)
+                return rows
+            except UnicodeDecodeError as exc:
+                last_error = exc
+                continue
+        raise UnicodeDecodeError(
+            last_error.encoding if last_error else "unknown",
+            last_error.object if last_error else b"",
+            last_error.start if last_error else 0,
+            last_error.end if last_error else 0,
+            (
+                f"无法读取 CSV 文件编码: {source_path}. "
+                f"已尝试: {', '.join(CSV_FALLBACK_ENCODINGS)}"
+            ),
+        )
 
     frame = pd.read_excel(
         source_path,
