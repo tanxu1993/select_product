@@ -123,6 +123,35 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def build_runtime_args(
+    *,
+    csv_path: str = DEFAULT_CSV_NAME,
+    excel_path: str = "",
+    sheet_name: str = "",
+    max_products: int | None = None,
+    max_results: int | None = None,
+    download_dir: str = "data/raw/csv_source_images",
+    background: bool = False,
+    bitbrowser_browser_ids: str = "",
+    workers: int | None = None,
+    no_resume: bool = False,
+) -> argparse.Namespace:
+    """为 CLI 和 GUI 统一构造运行参数。"""
+
+    return argparse.Namespace(
+        csv=csv_path,
+        excel=excel_path,
+        sheet_name=sheet_name,
+        max_products=max_products,
+        max_results=max_results,
+        download_dir=download_dir,
+        background=background,
+        bitbrowser_browser_ids=bitbrowser_browser_ids,
+        workers=workers,
+        no_resume=no_resume,
+    )
+
+
 def sanitize_filename(value: str, *, fallback: str) -> str:
     """把任意文本清洗为安全文件名。"""
 
@@ -1195,10 +1224,9 @@ def save_report_json(
     return report_path
 
 
-def main() -> None:
-    """读取表格主图，执行 1688 图搜图。"""
+def run_with_args(args: argparse.Namespace) -> dict[str, Any]:
+    """按传入参数执行 1688 图搜图并返回摘要。"""
 
-    args = parse_args()
     source_path = resolve_source_path(csv_path=args.csv, excel_path=args.excel)
     download_root = resolve_download_root(args.download_dir)
     settings = get_settings().model_copy(
@@ -1240,7 +1268,17 @@ def main() -> None:
             print(f"[csv-1688] source file: {source_path}", flush=True)
             print(f"[csv-1688] resume checkpoint: already processed {resume_offset} valid products", flush=True)
             print("[csv-1688] no remaining valid products to process.", flush=True)
-            return
+            return {
+                "status": "completed",
+                "source_path": str(source_path),
+                "resume_offset": resume_offset,
+                "valid_products": 0,
+                "worker_count": 0,
+                "processed_attempts": 0,
+                "processed_products": 0,
+                "json_path": "",
+                "excel_path": "",
+            }
         raise RuntimeError("表格中没有可用于 1688 图搜图的有效商品。")
 
     browser_ids = build_worker_browser_ids(
@@ -1481,6 +1519,28 @@ def main() -> None:
     if excel_result.get("error"):
         print(f"excel_error: {excel_result['error']}")
     print(f"json_path: {report_path}")
+
+    return {
+        "status": "completed",
+        "source_path": str(source_path),
+        "resume_offset": resume_offset,
+        "valid_products": load_stats["valid_rows"],
+        "worker_count": worker_count,
+        "processed_attempts": len(results),
+        "processed_products": len(completed_results),
+        "matched_items": report_stats["matched_items"],
+        "downloaded_images": load_stats["downloaded_images"],
+        "search_status": search_result["status"],
+        "detail_status": detail_result["status"],
+        "excel_path": str(excel_result.get("path") or ""),
+        "json_path": str(report_path),
+    }
+
+
+def main() -> None:
+    """读取表格主图，执行 1688 图搜图。"""
+
+    run_with_args(parse_args())
 
 
 if __name__ == "__main__":

@@ -286,6 +286,8 @@ class Settings(BaseSettings):
     def project_root(self) -> Path:
         """返回项目根目录。"""
 
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent
         return Path(__file__).resolve().parent.parent
 
     def resolve_local_path(self, raw_path: str) -> Path:
